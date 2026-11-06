@@ -16,6 +16,9 @@ trap cleanup EXIT
 hdiutil attach -readonly -nobrowse -mountpoint "$work/mount" "$1"
 mounted=1
 ditto "$work/mount" "$work/sdk"
+# La copia hereda los permisos de solo lectura del DMG: hay que poder modificarla.
+chflags -R nouchg "$work/sdk" 2>/dev/null || true
+chmod -R u+w "$work/sdk"
 python3 "$here/prepare-starter.py" "$work/sdk" "$here" "$work/project-path"
 project=$(cat "$work/project-path")
 xcodebuild -project "$project" -target Starter -configuration Release \
