@@ -401,9 +401,9 @@ ASBool FocalUnload() {
         }
     }
     geometryItem = trimItem = nullptr;
-    if (drawProc) ASCallbackDestroy(drawProc);
-    if (editProc) ASCallbackDestroy(editProc);
-    if (toggleProc) ASCallbackDestroy(toggleProc);
+    if (drawProc) ASCallbackDestroy(reinterpret_cast<ASCallback>(drawProc));
+    if (editProc) ASCallbackDestroy(reinterpret_cast<ASCallback>(editProc));
+    if (toggleProc) ASCallbackDestroy(reinterpret_cast<ASCallback>(toggleProc));
     drawProc = nullptr;
     editProc = toggleProc = nullptr;
     return true;
