@@ -1,4 +1,5 @@
 #import <AppKit/AppKit.h>
+#include <dlfcn.h>
 #include "FocalGeometry.h"
 #include <iomanip>
 #include <locale>
@@ -88,13 +89,6 @@ ACCB1 void ACCB2 toggleTrim(void*) {
     if (auto doc = AVAppGetActiveDoc()) redraw(AVDocGetPageView(doc));
 }
 
-struct DialogData {
-    int current, total;
-    std::string summary;
-    focal::Settings settings;
-    std::vector<int> pages;
-};
-
 bool readPages(std::wstring text, int total, std::vector<int>& pages) {
     text.erase(std::remove_if(text.begin(), text.end(), [](wchar_t c) {
         return c == L' ' || c == L'\t';
@@ -155,62 +149,6 @@ bool parseSetting(NSString* text, int index, std::optional<double>& field) {
         !(stream >> std::ws).eof()) return false;
     field = number;
     return true;
-}
-
-bool showGeometryDialog(DialogData& data) {
-    @autoreleasepool {
-        NSAlert* alert = [[NSAlert alloc] init];
-        alert.messageText = @"Focal · Geometría de páginas";
-        alert.informativeText = [NSString stringWithUTF8String:data.summary.c_str()];
-        [alert addButtonWithTitle:@"Aplicar"];
-        [alert addButtonWithTitle:@"Cancelar"];
-        NSView* view = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 430, 290)];
-        alert.accessoryView = view;
-        NSTextField* pages = addField(view, @"Páginas (1, 3-5, pares, impares, todas)", 239, 0, 430);
-        pages.stringValue = [NSString stringWithFormat:@"%d", data.current + 1];
-        NSString* labels[] = {
-            @"Ancho del recorte (mm)", @"Alto del recorte (mm)",
-            @"Desplazamiento X (mm)", @"Desplazamiento Y (mm)",
-            @"Escala X (%)", @"Escala Y (%)",
-            @"Giro adicional (°)", @"Sangre en 4 lados (mm)"
-        };
-        NSTextField* inputs[8];
-        NSView* previous = pages;
-        for (int i = 0; i < 8; ++i) {
-            inputs[i] = addField(view, labels[i], 186 - 51 * (i / 2), 220 * (i % 2), 210);
-            previous.nextKeyView = inputs[i];
-            previous = inputs[i];
-        }
-        previous.nextKeyView = pages;
-        NSTextField* hint = [NSTextField labelWithString:
-            @"Deja en blanco los valores que quieras conservar."];
-        hint.frame = NSMakeRect(0, 5, 430, 18);
-        [view addSubview:hint];
-        NSString* error = nil;
-        for (;;) {
-            alert.informativeText = error ?: [NSString stringWithUTF8String:data.summary.c_str()];
-            [alert.window setInitialFirstResponder:pages];
-            if ([alert runModal] != NSAlertFirstButtonReturn) return false;
-            const std::string selection(pages.stringValue.UTF8String);
-            if (selection.size() > 1023 ||
-                !readPages(std::wstring(selection.begin(), selection.end()), data.total, data.pages)) {
-                error = @"Revisa la selección de páginas.";
-                continue;
-            }
-            error = nil;
-            bool entered = false;
-            for (int i = 0; i < 8; ++i) {
-                if (!parseSetting(inputs[i].stringValue, i, data.settings[i])) {
-                    error = [NSString stringWithFormat:@"Revisa el valor de %@.", labels[i]];
-                    break;
-                }
-                entered = entered || data.settings[i].has_value();
-            }
-            if (error) continue;
-            if (entered) return true;
-            error = @"Introduce al menos un valor.";
-        }
-    }
 }
 
 struct Edit {
@@ -315,39 +253,39 @@ void applyEdit(PDDoc doc, const Edit& edit) {
     PDPageRelease(page);
 }
 
-void openGeometry() {
+// Aplica los ajustes a las páginas indicadas del PDF activo.
+// Devuelve "" si todo fue bien o un mensaje de error (UTF-8).
+std::string applyGeometry(const std::string& selection, const focal::Settings& settings, int& count) {
+    count = 0;
     const AVDoc doc = AVAppGetActiveDoc();
-    if (!doc) return;
-    if (!AVDocPermRequest(doc, PDPermReqObjDoc, PDPermReqOprModify)) {
-        AVAlertNote("El PDF no permite modificaciones.");
-        return;
-    }
-    const PDDoc pdf = AVDocGetPDDoc(doc);
-    const AVPageView view = AVDocGetPageView(doc);
-    if (!pdf || !view) return;
-    PDPage page = AVPageViewGetPage(view);
-    if (!page) return;
-    DialogData data{};
-    data.current = AVPageViewGetPageNum(view);
-    data.total = PDDocGetNumPages(pdf);
-    const auto boxes = readBoxes(page);
-    const double mm = 25.4 * PDPageGetUserUnitSize(page) / 72.0;
-    std::ostringstream summary;
-    summary << std::fixed << std::setprecision(2) << "Página " << data.current+1
-            << " · Recorte " << (boxes.trim.right-boxes.trim.left)*mm << " × "
-            << (boxes.trim.top-boxes.trim.bottom)*mm << " mm\nX "
-            << (boxes.media.left-boxes.trim.left)*mm << " mm · Y "
-            << (boxes.media.bottom-boxes.trim.bottom)*mm << " mm";
-    data.summary = summary.str();
-    if (!showGeometryDialog(data) || AVAppGetActiveDoc() != doc) return;
+    if (!doc) return "No hay ningún PDF abierto.";
+    PDDoc pdf = nullptr;
+    AVPageView view = nullptr;
+    int total = 0;
+    bool permitted = false, unreadable = false;
+    DURING
+        permitted = AVDocPermRequest(doc, PDPermReqObjDoc, PDPermReqOprModify);
+        pdf = AVDocGetPDDoc(doc);
+        view = AVDocGetPageView(doc);
+        if (pdf) total = PDDocGetNumPages(pdf);
+    HANDLER
+        unreadable = true;
+    END_HANDLER
+    if (unreadable || !pdf || !view) return "Acrobat no pudo leer la geometría del PDF.";
+    if (!permitted) return "El PDF no permite modificaciones.";
 
-    std::vector<Edit> edits(data.pages.size());
+    std::vector<int> pages;
+    if (selection.size() > 1023 ||
+        !readPages(std::wstring(selection.begin(), selection.end()), total, pages))
+        return "Revisa la selección de páginas.";
+
+    std::vector<Edit> edits(pages.size());
     int invalid = -1;
     bool failed = false;
     DURING
-        for (size_t i = 0; i < data.pages.size(); ++i) {
-            if (!prepareEdit(pdf,data.pages[i],data.settings,edits[i])) {
-                invalid = data.pages[i];
+        for (size_t i = 0; i < pages.size(); ++i) {
+            if (!prepareEdit(pdf,pages[i],settings,edits[i])) {
+                invalid = pages[i];
                 break;
             }
         }
@@ -358,16 +296,286 @@ void openGeometry() {
     HANDLER
         failed = true;
     END_HANDLER
-    if (failed) {
-        AVAlertNote("Acrobat interrumpio el cambio. Cierra la copia de trabajo sin guardar y vuelve a abrirla.");
-    } else if (invalid >= 0) {
-        const std::string error = "Pagina " + std::to_string(invalid+1) +
-            ": medidas fuera de rango o anotaciones incompatibles con escala/giro.";
-        AVAlertNote(error.c_str());
-    } else {
-        showTrim = true;
+    if (failed)
+        return "Acrobat interrumpió el cambio. Cierra la copia de trabajo sin guardar y vuelve a abrirla.";
+    if (invalid >= 0)
+        return "Página " + std::to_string(invalid+1) +
+               ": medidas fuera de rango o anotaciones incompatibles con escala/giro.";
+    showTrim = true;
+    DURING
         redraw(view);
+    HANDLER
+    END_HANDLER
+    count = static_cast<int>(pages.size());
+    return {};
+}
+
+// Geometría actual de la página visible, en milímetros.
+struct PageInfo {
+    bool ok = false;
+    AVDoc doc = nullptr;
+    int number = 0, total = 0;
+    double width = 0, height = 0, x = 0, y = 0, bleed = 0;
+    bool hasBleed = false;
+};
+
+PageInfo readPageInfo() {
+    PageInfo info;
+    info.doc = AVAppGetActiveDoc();
+    if (!info.doc) return info;
+    DURING
+        const AVPageView view = AVDocGetPageView(info.doc);
+        const PDDoc pdf = AVDocGetPDDoc(info.doc);
+        PDPage page = view ? AVPageViewGetPage(view) : nullptr;
+        if (page && pdf) {
+            const auto boxes = readBoxes(page);
+            const double mm = 25.4 * PDPageGetUserUnitSize(page) / 72.0;
+            info.number = AVPageViewGetPageNum(view);
+            info.total = PDDocGetNumPages(pdf);
+            info.width = (boxes.trim.right - boxes.trim.left) * mm;
+            info.height = (boxes.trim.top - boxes.trim.bottom) * mm;
+            info.x = (boxes.media.left - boxes.trim.left) * mm;
+            info.y = (boxes.media.bottom - boxes.trim.bottom) * mm;
+            const double l = boxes.trim.left - boxes.bleed.left;
+            const double b = boxes.trim.bottom - boxes.bleed.bottom;
+            const double r = boxes.bleed.right - boxes.trim.right;
+            const double t = boxes.bleed.top - boxes.trim.top;
+            const double eps = 1e-3;
+            info.hasBleed = l >= 0 && std::fabs(l-b) < eps && std::fabs(l-r) < eps &&
+                            std::fabs(l-t) < eps;
+            info.bleed = l * mm;
+            info.ok = true;
+        }
+    HANDLER
+        info.ok = false;
+    END_HANDLER
+    return info;
+}
+
+NSString* numberText(double value) {
+    if (std::fabs(value) < 0.005) value = 0;
+    return [NSString stringWithFormat:@"%.2f", value];
+}
+
+NSString* const kLabels[8] = {
+    @"Ancho del recorte (mm)", @"Alto del recorte (mm)",
+    @"Desplazamiento X (mm)", @"Desplazamiento Y (mm)",
+    @"Escala X (%)", @"Escala Y (%)",
+    @"Giro adicional (°)", @"Sangre en 4 lados (mm)"
+};
+}  // namespace
+
+// Panel no modal: se queda abierto después de aplicar los cambios.
+@interface FocalPanelController : NSObject <NSWindowDelegate>
+@property (strong) NSPanel* panel;
+@property (strong) NSTextField* summary;
+@property (strong) NSTextField* status;
+@property (strong) NSTextField* pages;
+@property (strong) NSArray<NSTextField*>* inputs;
+@property (strong) NSArray<NSString*>* initial;
+@property (assign) AVDoc lastDoc;
+@property (assign) int lastPage;
+@property (assign) BOOL positioned;
+- (void)show;
+- (void)refreshFromPage:(BOOL)resetPages;
+@end
+
+@implementation FocalPanelController
+
+- (NSImage*)loadLogo {
+    NSBundle* bundle = [NSBundle bundleForClass:[FocalPanelController class]];
+    NSImage* logo = [bundle imageForResource:@"FocalLogo"];
+    if (logo) return logo;
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<const void*>(&FocalInit), &info) && info.dli_fname) {
+        NSString* binary = [NSString stringWithUTF8String:info.dli_fname];
+        NSString* root = [[[binary stringByDeletingLastPathComponent]
+            stringByDeletingLastPathComponent] stringByDeletingLastPathComponent];
+        NSString* path = [root stringByAppendingPathComponent:@"Contents/Resources/FocalLogo.png"];
+        return [[NSImage alloc] initWithContentsOfFile:path];
     }
+    return nil;
+}
+
+- (instancetype)init {
+    self = [super init];
+    if (!self) return nil;
+    const CGFloat width = 470, height = 430;
+    NSPanel* panel = [[NSPanel alloc]
+        initWithContentRect:NSMakeRect(0, 0, width, height)
+                  styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable)
+                    backing:NSBackingStoreBuffered
+                      defer:NO];
+    panel.title = @"Focal Geometry";
+    panel.floatingPanel = YES;
+    panel.hidesOnDeactivate = YES;
+    panel.releasedWhenClosed = NO;
+    panel.delegate = self;
+    NSView* content = panel.contentView;
+
+    CGFloat textX = 20;
+    NSImage* logo = [self loadLogo];
+    if (logo) {
+        NSImageView* imageView = [[NSImageView alloc] initWithFrame:NSMakeRect(20, 366, 56, 56)];
+        imageView.image = logo;
+        imageView.imageScaling = NSImageScaleProportionallyUpOrDown;
+        [content addSubview:imageView];
+        textX = 86;
+    }
+    NSTextField* heading = [NSTextField labelWithString:@"Focal · Geometría de páginas"];
+    heading.font = [NSFont boldSystemFontOfSize:15];
+    heading.frame = NSMakeRect(textX, 400, width - textX - 20, 22);
+    [content addSubview:heading];
+    self.summary = [NSTextField labelWithString:@""];
+    self.summary.frame = NSMakeRect(textX, 372, width - textX - 20, 20);
+    [content addSubview:self.summary];
+
+    NSView* fields = [[NSView alloc] initWithFrame:NSMakeRect(20, 70, 430, 290)];
+    [content addSubview:fields];
+    NSTextField* pages = addField(fields, @"Páginas (1, 3-5, pares, impares, todas)", 239, 0, 430);
+    NSMutableArray<NSTextField*>* inputs = [NSMutableArray array];
+    NSMutableArray<NSString*>* initial = [NSMutableArray array];
+    NSView* previous = pages;
+    for (int i = 0; i < 8; ++i) {
+        NSTextField* input = addField(fields, kLabels[i], 186 - 51 * (i / 2), 220 * (i % 2), 210);
+        previous.nextKeyView = input;
+        previous = input;
+        [inputs addObject:input];
+        [initial addObject:@""];
+    }
+    previous.nextKeyView = pages;
+    NSTextField* hint = [NSTextField labelWithString:
+        @"Se muestra la geometría actual; solo se aplican los valores que cambies."];
+    hint.frame = NSMakeRect(0, 5, 430, 18);
+    hint.font = [NSFont systemFontOfSize:11];
+    hint.textColor = [NSColor secondaryLabelColor];
+    [fields addSubview:hint];
+
+    self.status = [NSTextField labelWithString:@""];
+    self.status.frame = NSMakeRect(20, 44, 430, 18);
+    [content addSubview:self.status];
+
+    NSButton* reload = [NSButton buttonWithTitle:@"Actualizar" target:self action:@selector(reloadPressed:)];
+    reload.frame = NSMakeRect(20, 10, 100, 28);
+    [content addSubview:reload];
+    NSButton* apply = [NSButton buttonWithTitle:@"Aplicar" target:self action:@selector(applyPressed:)];
+    apply.frame = NSMakeRect(262, 10, 90, 28);
+    apply.keyEquivalent = @"\r";
+    [content addSubview:apply];
+    NSButton* close = [NSButton buttonWithTitle:@"Cerrar" target:self action:@selector(closePressed:)];
+    close.frame = NSMakeRect(360, 10, 90, 28);
+    close.keyEquivalent = @"\033";
+    [content addSubview:close];
+    panel.defaultButtonCell = (NSButtonCell*)apply.cell;
+    [panel setInitialFirstResponder:pages];
+
+    self.panel = panel;
+    self.pages = pages;
+    self.inputs = inputs;
+    self.initial = initial;
+    self.lastPage = -1;
+    return self;
+}
+
+- (void)report:(NSString*)message failed:(BOOL)failed {
+    self.status.stringValue = message;
+    self.status.textColor = failed ? [NSColor systemRedColor] : [NSColor systemGreenColor];
+}
+
+- (void)refreshFromPage:(BOOL)resetPages {
+    const PageInfo info = readPageInfo();
+    NSMutableArray<NSString*>* initial = [NSMutableArray array];
+    if (!info.ok) {
+        self.summary.stringValue = @"Abre un PDF para ver su geometría.";
+        for (int i = 0; i < 8; ++i) {
+            self.inputs[i].stringValue = @"";
+            [initial addObject:@""];
+        }
+        self.initial = initial;
+        self.lastDoc = info.doc;
+        self.lastPage = -1;
+        return;
+    }
+    NSString* values[8] = {
+        numberText(info.width), numberText(info.height),
+        numberText(info.x), numberText(info.y),
+        @"100", @"100", @"0",
+        info.hasBleed ? numberText(info.bleed) : @""
+    };
+    for (int i = 0; i < 8; ++i) {
+        self.inputs[i].stringValue = values[i];
+        [initial addObject:values[i]];
+    }
+    self.initial = initial;
+    if (resetPages) self.pages.stringValue = [NSString stringWithFormat:@"%d", info.number + 1];
+    self.summary.stringValue = [NSString stringWithFormat:@"Página %d de %d · Recorte %@ × %@ mm",
+        info.number + 1, info.total, numberText(info.width), numberText(info.height)];
+    self.lastDoc = info.doc;
+    self.lastPage = info.number;
+}
+
+- (void)show {
+    [self refreshFromPage:YES];
+    [self report:@"" failed:NO];
+    if (!self.positioned) {
+        [self.panel center];
+        self.positioned = YES;
+    }
+    [self.panel makeKeyAndOrderFront:nil];
+}
+
+- (void)applyPressed:(id)sender {
+    focal::Settings settings{};
+    bool changed = false;
+    for (int i = 0; i < 8; ++i) {
+        NSString* text = self.inputs[i].stringValue;
+        if ([text isEqualToString:self.initial[i]]) continue;
+        if (!parseSetting(text, i, settings[i])) {
+            [self report:[NSString stringWithFormat:@"Revisa el valor de %@.", kLabels[i]] failed:YES];
+            return;
+        }
+        changed = changed || settings[i].has_value();
+    }
+    if (!changed) {
+        [self report:@"No has cambiado ningún valor." failed:YES];
+        return;
+    }
+    int count = 0;
+    const std::string error = applyGeometry(std::string(self.pages.stringValue.UTF8String), settings, count);
+    if (!error.empty()) {
+        [self report:[NSString stringWithUTF8String:error.c_str()] failed:YES];
+        return;
+    }
+    [self refreshFromPage:NO];
+    [self report:[NSString stringWithFormat:@"Cambios aplicados a %d página%@.",
+                  count, count == 1 ? @"" : @"s"] failed:NO];
+}
+
+- (void)reloadPressed:(id)sender {
+    [self refreshFromPage:YES];
+    [self report:@"" failed:NO];
+}
+
+- (void)closePressed:(id)sender {
+    [self.panel close];
+}
+
+// Al volver al panel tras cambiar de página o de documento, se releen los valores.
+- (void)windowDidBecomeKey:(NSNotification*)notification {
+    const PageInfo info = readPageInfo();
+    if (info.doc != self.lastDoc || (info.ok ? info.number : -1) != self.lastPage)
+        [self refreshFromPage:YES];
+}
+
+@end
+
+namespace {
+FocalPanelController* panelController = nil;
+
+void openGeometry() {
+    if (!AVAppGetActiveDoc()) return;
+    if (!panelController) panelController = [[FocalPanelController alloc] init];
+    [panelController show];
 }
 
 ACCB1 void ACCB2 editGeometry(void*) {
@@ -390,6 +598,10 @@ AVMenuItem addItem(AVMenu menu, ASExtension extension, const char* title,
 }
 
 ASBool FocalUnload() {
+    if (panelController) {
+        [panelController.panel close];
+        panelController = nil;
+    }
     if (drawingRegistered) {
         AVAppUnregisterForPageViewDrawing(drawProc);
         drawingRegistered = false;

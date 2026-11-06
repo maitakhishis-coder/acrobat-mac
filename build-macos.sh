@@ -56,6 +56,14 @@ if [[ -z "$bundle" ]]; then
     exit 1
 fi
 echo "Bundle generado: $bundle"
+# Logo opcional para el panel: si existe FocalLogo.png junto a este script, se incluye en el plugin.
+if [[ -f "$here/FocalLogo.png" ]]; then
+    mkdir -p "$bundle/Contents/Resources"
+    cp "$here/FocalLogo.png" "$bundle/Contents/Resources/FocalLogo.png"
+    echo "Logo incluido: FocalLogo.png"
+else
+    echo "Aviso: no hay FocalLogo.png; el panel se mostrará sin logo."
+fi
 executable=$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "$bundle/Contents/Info.plist")
 lipo -info "$bundle/Contents/MacOS/$executable"
 lipo "$bundle/Contents/MacOS/$executable" -verify_arch arm64 x86_64
