@@ -23,9 +23,14 @@ python3 "$here/prepare-starter.py" "$work/sdk" "$here" "$work/project-path"
 project=$(cat "$work/project-path")
 echo "=== Xcode ==="
 xcodebuild -version || true
-xcodebuild -list -project "$project" || true
+listing=$(xcodebuild -list -project "$project")
+echo "$listing"
+target=$(echo "$listing" | awk '/Targets:/{f=1;next} /Build Configurations:/{f=0} f&&NF{print $1; exit}')
+config=$(echo "$listing" | awk '/Build Configurations:/{f=1;next} /If no build/{f=0} f&&NF{print $1; exit}')
+[[ -n "$target" && -n "$config" ]] || { echo "No se pudo leer objetivo/configuración del proyecto." >&2; exit 1; }
+echo "Usando objetivo: $target, configuración: $config"
 echo "=== Compilando (el registro completo se guarda y se resume si falla) ==="
-if ! xcodebuild -project "$project" -target Starter -configuration Release \
+if ! xcodebuild -project "$project" -target "$target" -configuration "$config" \
     'ARCHS=arm64 x86_64' ONLY_ACTIVE_ARCH=NO \
     CLANG_CXX_LANGUAGE_STANDARD=c++17 CLANG_ENABLE_OBJC_ARC=YES \
     'OTHER_LDFLAGS=$(inherited) -framework AppKit' \
@@ -37,8 +42,13 @@ if ! xcodebuild -project "$project" -target Starter -configuration Release \
     tail -n 40 "$work/xcode.log"
     exit 1
 fi
-bundle="$work/build/FocalGeometry.acroplugin"
-test -d "$bundle"
+bundle=$(find "$work/build" -maxdepth 1 -name '*.acroplugin' | head -1)
+if [[ -z "$bundle" ]]; then
+    echo "No se generó ningún .acroplugin. Contenido de la carpeta de salida:" >&2
+    ls -la "$work/build" >&2 || true
+    exit 1
+fi
+echo "Bundle generado: $bundle"
 executable=$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "$bundle/Contents/Info.plist")
 lipo -verify_arch arm64 x86_64 "$bundle/Contents/MacOS/$executable"
 mkdir -p "$PWD/dist"
