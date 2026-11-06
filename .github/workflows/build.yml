@@ -1,0 +1,43 @@
+# Guardar como .github/workflows/build.yml en un repositorio PRIVADO de GitHub.
+# El repositorio debe contener los archivos del zip (FocalGeometry.h, Geometry.h,
+# FocalGeometry.mm, build-macos.sh, prepare-starter.py) y make-installer.sh en la raíz.
+#
+# El DMG del SDK de Adobe NO se sube al repositorio: se sube como "release asset"
+# (ver instrucciones en la conversación) para no mezclarlo con el código.
+name: Build FocalGeometry
+
+on:
+  workflow_dispatch:   # se lanza a mano desde la pestaña Actions
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Descargar el SDK de Adobe (release privado)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download sdk-2023 --pattern '*.dmg' --dir "$RUNNER_TEMP"
+
+      - name: Prueba del cálculo de geometría
+        run: |
+          clang++ -std=c++17 GeometryTest.cpp -o "$RUNNER_TEMP/gt"
+          "$RUNNER_TEMP/gt"
+
+      - name: Compilar el plugin (Intel + Apple Silicon)
+        run: bash build-macos.sh "$RUNNER_TEMP/Acrobat_DC_SDK_Mac_2023_V5.dmg"
+
+      - name: Crear el instalador
+        run: bash make-installer.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FocalGeometry
+          path: |
+            dist/FocalGeometry.acroplugin
+            dist/*.pkg
+          retention-days: 7
