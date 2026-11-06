@@ -57,7 +57,8 @@ if [[ -z "$bundle" ]]; then
 fi
 echo "Bundle generado: $bundle"
 executable=$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "$bundle/Contents/Info.plist")
-lipo -verify_arch arm64 x86_64 "$bundle/Contents/MacOS/$executable"
+lipo -info "$bundle/Contents/MacOS/$executable"
+lipo "$bundle/Contents/MacOS/$executable" -verify_arch arm64 x86_64
 mkdir -p "$PWD/dist"
 ditto "$bundle" "$PWD/dist/FocalGeometry.acroplugin"
 echo "Compilado para Intel y Apple Silicon: $PWD/dist/FocalGeometry.acroplugin"
