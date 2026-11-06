@@ -49,6 +49,15 @@ void redraw(AVPageView view) {
     AVPageViewDrawNow(view);
 }
 
+void redrawActive() {
+    const AVDoc doc = AVAppGetActiveDoc();
+    if (!doc) return;
+    DURING
+        redraw(AVDocGetPageView(doc));
+    HANDLER
+    END_HANDLER
+}
+
 ACCB1 void ACCB2 drawTrim(AVPageView view, AVDevRect*, void*) {
     if (!showTrim || !view) return;
     const PDPageNumber original = AVPageViewGetPageNum(view);
@@ -261,13 +270,14 @@ std::string applyGeometry(const std::string& selection, const focal::Settings& s
     if (!doc) return "No hay ningún PDF abierto.";
     PDDoc pdf = nullptr;
     AVPageView view = nullptr;
-    int total = 0;
+    int total = 0, current = -1;
     bool permitted = false, unreadable = false;
     DURING
         permitted = AVDocPermRequest(doc, PDPermReqObjDoc, PDPermReqOprModify);
         pdf = AVDocGetPDDoc(doc);
         view = AVDocGetPageView(doc);
         if (pdf) total = PDDocGetNumPages(pdf);
+        if (view) current = AVPageViewGetPageNum(view);
     HANDLER
         unreadable = true;
     END_HANDLER
@@ -275,9 +285,13 @@ std::string applyGeometry(const std::string& selection, const focal::Settings& s
     if (!permitted) return "El PDF no permite modificaciones.";
 
     std::vector<int> pages;
-    if (selection.size() > 1023 ||
-        !readPages(std::wstring(selection.begin(), selection.end()), total, pages))
+    if (selection == "actual") {
+        if (current < 0 || current >= total) return "Acrobat no pudo identificar la página actual.";
+        pages.push_back(current);
+    } else if (selection.size() > 1023 ||
+               !readPages(std::wstring(selection.begin(), selection.end()), total, pages)) {
         return "Revisa la selección de páginas.";
+    }
 
     std::vector<Edit> edits(pages.size());
     int invalid = -1;
@@ -370,14 +384,17 @@ NSString* const kLabels[8] = {
 @property (strong) NSPanel* panel;
 @property (strong) NSTextField* summary;
 @property (strong) NSTextField* status;
-@property (strong) NSTextField* pages;
+@property (strong) NSTextField* range;
+@property (strong) NSButton* trimCheck;
+@property (strong) NSArray<NSButton*>* modes;
 @property (strong) NSArray<NSTextField*>* inputs;
 @property (strong) NSArray<NSString*>* initial;
+@property (strong) NSTimer* timer;
 @property (assign) AVDoc lastDoc;
 @property (assign) int lastPage;
 @property (assign) BOOL positioned;
 - (void)show;
-- (void)refreshFromPage:(BOOL)resetPages;
+- (void)shutdown;
 @end
 
 @implementation FocalPanelController
@@ -400,7 +417,7 @@ NSString* const kLabels[8] = {
 - (instancetype)init {
     self = [super init];
     if (!self) return nil;
-    const CGFloat width = 470, height = 430;
+    const CGFloat width = 470, height = 472;
     NSPanel* panel = [[NSPanel alloc]
         initWithContentRect:NSMakeRect(0, 0, width, height)
                   styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable)
@@ -413,10 +430,11 @@ NSString* const kLabels[8] = {
     panel.delegate = self;
     NSView* content = panel.contentView;
 
+    // Cabecera: logo, título y resumen de la página
     CGFloat textX = 20;
     NSImage* logo = [self loadLogo];
     if (logo) {
-        NSImageView* imageView = [[NSImageView alloc] initWithFrame:NSMakeRect(20, 366, 56, 56)];
+        NSImageView* imageView = [[NSImageView alloc] initWithFrame:NSMakeRect(20, 408, 56, 56)];
         imageView.image = logo;
         imageView.imageScaling = NSImageScaleProportionallyUpOrDown;
         [content addSubview:imageView];
@@ -424,32 +442,73 @@ NSString* const kLabels[8] = {
     }
     NSTextField* heading = [NSTextField labelWithString:@"Focal · Geometría de páginas"];
     heading.font = [NSFont boldSystemFontOfSize:15];
-    heading.frame = NSMakeRect(textX, 400, width - textX - 20, 22);
+    heading.frame = NSMakeRect(textX, 442, width - textX - 20, 22);
     [content addSubview:heading];
     self.summary = [NSTextField labelWithString:@""];
-    self.summary.frame = NSMakeRect(textX, 372, width - textX - 20, 20);
+    self.summary.frame = NSMakeRect(textX, 414, width - textX - 20, 20);
     [content addSubview:self.summary];
 
-    NSView* fields = [[NSView alloc] initWithFrame:NSMakeRect(20, 70, 430, 290)];
+    NSView* fields = [[NSView alloc] initWithFrame:NSMakeRect(20, 96, 430, 305)];
     [content addSubview:fields];
-    NSTextField* pages = addField(fields, @"Páginas (1, 3-5, pares, impares, todas)", 239, 0, 430);
+
+    // Selección de páginas: opciones rápidas + rango personalizado
+    NSTextField* applyTo = [NSTextField labelWithString:@"Aplicar a:"];
+    applyTo.frame = NSMakeRect(0, 285, 430, 17);
+    [fields addSubview:applyTo];
+    NSString* modeTitles[4] = {@"Esta página", @"Todas", @"Pares", @"Impares"};
+    const CGFloat modeX[4] = {0, 118, 200, 282};
+    const CGFloat modeW[4] = {115, 78, 78, 100};
+    NSMutableArray<NSButton*>* modes = [NSMutableArray array];
+    for (int i = 0; i < 4; ++i) {
+        NSButton* radio = [NSButton radioButtonWithTitle:modeTitles[i]
+                                                  target:self
+                                                  action:@selector(modeChanged:)];
+        radio.frame = NSMakeRect(modeX[i], 260, modeW[i], 22);
+        radio.tag = i;
+        [fields addSubview:radio];
+        [modes addObject:radio];
+    }
+    NSButton* rangeRadio = [NSButton radioButtonWithTitle:@"Rango:"
+                                                   target:self
+                                                   action:@selector(modeChanged:)];
+    rangeRadio.frame = NSMakeRect(0, 234, 72, 22);
+    rangeRadio.tag = 4;
+    [fields addSubview:rangeRadio];
+    [modes addObject:rangeRadio];
+    modes[0].state = NSControlStateValueOn;
+    NSTextField* range = [NSTextField textFieldWithString:@""];
+    range.frame = NSMakeRect(76, 234, 354, 22);
+    range.placeholderString = @"Ejemplo: 1, 3-5, 8";
+    range.enabled = NO;
+    [fields addSubview:range];
+
+    // Medidas
     NSMutableArray<NSTextField*>* inputs = [NSMutableArray array];
     NSMutableArray<NSString*>* initial = [NSMutableArray array];
-    NSView* previous = pages;
+    NSView* previous = nil;
     for (int i = 0; i < 8; ++i) {
         NSTextField* input = addField(fields, kLabels[i], 186 - 51 * (i / 2), 220 * (i % 2), 210);
-        previous.nextKeyView = input;
+        if (previous) previous.nextKeyView = input;
         previous = input;
         [inputs addObject:input];
         [initial addObject:@""];
     }
-    previous.nextKeyView = pages;
+    previous.nextKeyView = range;
+    range.nextKeyView = inputs[0];
     NSTextField* hint = [NSTextField labelWithString:
         @"Se muestra la geometría actual; solo se aplican los valores que cambies."];
     hint.frame = NSMakeRect(0, 5, 430, 18);
     hint.font = [NSFont systemFontOfSize:11];
     hint.textColor = [NSColor secondaryLabelColor];
     [fields addSubview:hint];
+
+    // Guía azul del TrimBox
+    NSButton* trim = [NSButton checkboxWithTitle:@"Mostrar guía azul del TrimBox en el visor"
+                                          target:self
+                                          action:@selector(trimToggled:)];
+    trim.frame = NSMakeRect(20, 68, 430, 20);
+    trim.state = showTrim ? NSControlStateValueOn : NSControlStateValueOff;
+    [content addSubview:trim];
 
     self.status = [NSTextField labelWithString:@""];
     self.status.frame = NSMakeRect(20, 44, 430, 18);
@@ -467,22 +526,44 @@ NSString* const kLabels[8] = {
     close.keyEquivalent = @"\033";
     [content addSubview:close];
     panel.defaultButtonCell = (NSButtonCell*)apply.cell;
-    [panel setInitialFirstResponder:pages];
+    [panel setInitialFirstResponder:inputs[0]];
 
     self.panel = panel;
-    self.pages = pages;
+    self.range = range;
+    self.trimCheck = trim;
+    self.modes = modes;
     self.inputs = inputs;
     self.initial = initial;
     self.lastPage = -1;
     return self;
 }
 
-- (void)report:(NSString*)message failed:(BOOL)failed {
+- (void)say:(NSString*)message color:(NSColor*)color {
     self.status.stringValue = message;
-    self.status.textColor = failed ? [NSColor systemRedColor] : [NSColor systemGreenColor];
+    self.status.textColor = color;
 }
 
-- (void)refreshFromPage:(BOOL)resetPages {
+- (void)report:(NSString*)message failed:(BOOL)failed {
+    [self say:message color:(failed ? [NSColor systemRedColor] : [NSColor systemGreenColor])];
+}
+
+- (void)showSummary:(const PageInfo&)info {
+    self.summary.stringValue = [NSString stringWithFormat:@"Página %d de %d · Recorte %@ × %@ mm",
+        info.number + 1, info.total, numberText(info.width), numberText(info.height)];
+}
+
+- (BOOL)isDirty {
+    for (int i = 0; i < 8; ++i)
+        if (![self.inputs[i].stringValue isEqualToString:self.initial[i]]) return YES;
+    return NO;
+}
+
+- (void)syncTrim {
+    const NSControlStateValue wanted = showTrim ? NSControlStateValueOn : NSControlStateValueOff;
+    if (self.trimCheck.state != wanted) self.trimCheck.state = wanted;
+}
+
+- (void)refreshFromPage {
     const PageInfo info = readPageInfo();
     NSMutableArray<NSString*>* initial = [NSMutableArray array];
     if (!info.ok) {
@@ -507,21 +588,67 @@ NSString* const kLabels[8] = {
         [initial addObject:values[i]];
     }
     self.initial = initial;
-    if (resetPages) self.pages.stringValue = [NSString stringWithFormat:@"%d", info.number + 1];
-    self.summary.stringValue = [NSString stringWithFormat:@"Página %d de %d · Recorte %@ × %@ mm",
-        info.number + 1, info.total, numberText(info.width), numberText(info.height)];
+    [self showSummary:info];
     self.lastDoc = info.doc;
     self.lastPage = info.number;
 }
 
 - (void)show {
-    [self refreshFromPage:YES];
+    [self refreshFromPage];
+    [self syncTrim];
     [self report:@"" failed:NO];
     if (!self.positioned) {
         [self.panel center];
         self.positioned = YES;
     }
     [self.panel makeKeyAndOrderFront:nil];
+    if (!self.timer)
+        self.timer = [NSTimer scheduledTimerWithTimeInterval:0.4 target:self
+                                                    selector:@selector(tick:) userInfo:nil repeats:YES];
+}
+
+- (void)shutdown {
+    [self.timer invalidate];
+    self.timer = nil;
+    [self.panel close];
+}
+
+// Vigila cambios de documento o de página para mantener los valores al día.
+- (void)tick:(NSTimer*)timer {
+    if (!self.panel.isVisible) return;
+    [self syncTrim];
+    const PageInfo info = readPageInfo();
+    const int page = info.ok ? info.number : -1;
+    if (info.doc == self.lastDoc && page == self.lastPage) return;
+    if (info.ok && self.lastPage >= 0 && [self isDirty]) {
+        // Hay cambios sin aplicar: no se pisan los valores escritos.
+        self.lastDoc = info.doc;
+        self.lastPage = page;
+        [self showSummary:info];
+        [self say:@"La página ha cambiado. Pulsa Actualizar para cargar sus valores."
+            color:[NSColor secondaryLabelColor]];
+        return;
+    }
+    [self refreshFromPage];
+    [self say:@"" color:[NSColor secondaryLabelColor]];
+}
+
+- (std::string)pageSelection {
+    static const char* const keys[4] = {"actual", "todas", "pares", "impares"};
+    for (int i = 0; i < 4; ++i)
+        if (self.modes[i].state == NSControlStateValueOn) return keys[i];
+    return std::string(self.range.stringValue.UTF8String);
+}
+
+- (void)modeChanged:(NSButton*)sender {
+    const BOOL custom = sender.tag == 4;
+    self.range.enabled = custom;
+    if (custom) [self.panel makeFirstResponder:self.range];
+}
+
+- (void)trimToggled:(NSButton*)sender {
+    showTrim = sender.state == NSControlStateValueOn;
+    redrawActive();
 }
 
 - (void)applyPressed:(id)sender {
@@ -541,18 +668,19 @@ NSString* const kLabels[8] = {
         return;
     }
     int count = 0;
-    const std::string error = applyGeometry(std::string(self.pages.stringValue.UTF8String), settings, count);
+    const std::string error = applyGeometry([self pageSelection], settings, count);
     if (!error.empty()) {
         [self report:[NSString stringWithUTF8String:error.c_str()] failed:YES];
         return;
     }
-    [self refreshFromPage:NO];
+    [self refreshFromPage];
+    [self syncTrim];
     [self report:[NSString stringWithFormat:@"Cambios aplicados a %d página%@.",
                   count, count == 1 ? @"" : @"s"] failed:NO];
 }
 
 - (void)reloadPressed:(id)sender {
-    [self refreshFromPage:YES];
+    [self refreshFromPage];
     [self report:@"" failed:NO];
 }
 
@@ -560,11 +688,9 @@ NSString* const kLabels[8] = {
     [self.panel close];
 }
 
-// Al volver al panel tras cambiar de página o de documento, se releen los valores.
-- (void)windowDidBecomeKey:(NSNotification*)notification {
-    const PageInfo info = readPageInfo();
-    if (info.doc != self.lastDoc || (info.ok ? info.number : -1) != self.lastPage)
-        [self refreshFromPage:YES];
+- (void)windowWillClose:(NSNotification*)notification {
+    [self.timer invalidate];
+    self.timer = nil;
 }
 
 @end
@@ -599,7 +725,7 @@ AVMenuItem addItem(AVMenu menu, ASExtension extension, const char* title,
 
 ASBool FocalUnload() {
     if (panelController) {
-        [panelController.panel close];
+        [panelController shutdown];
         panelController = nil;
     }
     if (drawingRegistered) {
