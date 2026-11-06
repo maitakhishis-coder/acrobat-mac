@@ -19,8 +19,14 @@ for file in starter.rglob("*.cpp"):
 if len(candidates) != 1:
     sys.exit("No se pudo identificar de forma inequívoca la inicialización del ejemplo Starter.")
 init, content = candidates[0]
-if "gExtensionID" not in content:
-    sys.exit("El ejemplo Starter no declara ni usa el identificador gExtensionID.")
+# gExtensionID suele definirse en otro archivo del SDK (p. ej. PIMain.cpp).
+defined = any("gExtensionID" in f.read_text(encoding="utf-8-sig", errors="replace")
+              for ext in ("*.c", "*.cpp", "*.h")
+              for f in sdk.rglob(ext))
+if not defined:
+    sys.exit("No se encontró gExtensionID en ningún archivo del SDK.")
+if not re.search(r"\bextern\s+ASExtension\s+gExtensionID\b", content):
+    content = "extern ASExtension gExtensionID;\n" + content
 
 for match in reversed(list(pattern.finditer(content))):
     start = match.end()
