@@ -19,6 +19,13 @@ ditto "$work/mount" "$work/sdk"
 # La copia hereda los permisos de solo lectura del DMG: hay que poder modificarla.
 chflags -R nouchg "$work/sdk" 2>/dev/null || true
 chmod -R u+w "$work/sdk"
+# El Starter trae un paso posterior que copia el plugin a la carpeta de Acrobat.
+# Aquí no hay Acrobat (ni hace falta): se sustituye por un script vacío en la copia temporal.
+while IFS= read -r copier; do
+    printf '#!/bin/sh\nexit 0\n' > "$copier"
+    chmod +x "$copier"
+    echo "Neutralizado: $copier"
+done < <(find "$work/sdk" -name 'MacCopyToPlugins.sh')
 python3 "$here/prepare-starter.py" "$work/sdk" "$here" "$work/project-path"
 project=$(cat "$work/project-path")
 echo "=== Xcode ==="
