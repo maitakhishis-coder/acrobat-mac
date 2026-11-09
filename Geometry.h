@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <optional>
+#include <string>
 
 namespace focal {
 struct Box { double left, bottom, right, top; };
@@ -15,6 +16,90 @@ inline bool same(Box a, Box b) {
     return a.left == b.left && a.bottom == b.bottom &&
            a.right == b.right && a.top == b.top;
 }
+// Evalúa operaciones sencillas: + - * / paréntesis, coma o punto decimal y la unidad
+// opcional "mm" (que se ignora). Ejemplo: "122 mm+2" -> 124. Devuelve false si no es válida.
+namespace detail {
+class Expression {
+public:
+    explicit Expression(const std::string& text) : s(text) {}
+    bool evaluate(double& result) {
+        double value = 0;
+        if (s.size() > 200 || !sum(value, 0)) return false;
+        skip();
+        if (pos != s.size() || !std::isfinite(value)) return false;
+        result = value;
+        return true;
+    }
+private:
+    const std::string& s;
+    size_t pos = 0;
+    static bool digit(char c) { return c >= '0' && c <= '9'; }
+    void skip() { while (pos < s.size() && (s[pos] == ' ' || s[pos] == '\t')) ++pos; }
+    bool peek(char c) { skip(); return pos < s.size() && s[pos] == c; }
+    bool sum(double& value, int depth) {
+        if (!product(value, depth)) return false;
+        for (;;) {
+            double other = 0;
+            if (peek('+')) { ++pos; if (!product(other, depth)) return false; value += other; }
+            else if (peek('-')) { ++pos; if (!product(other, depth)) return false; value -= other; }
+            else return true;
+        }
+    }
+    bool product(double& value, int depth) {
+        if (!unary(value, depth)) return false;
+        for (;;) {
+            double other = 0;
+            if (peek('*')) { ++pos; if (!unary(other, depth)) return false; value *= other; }
+            else if (peek('/')) {
+                ++pos;
+                if (!unary(other, depth) || other == 0) return false;
+                value /= other;
+            }
+            else return true;
+        }
+    }
+    bool unary(double& value, int depth) {
+        if (depth > 40) return false;
+        if (peek('-')) { ++pos; if (!unary(value, depth + 1)) return false; value = -value; return true; }
+        if (peek('+')) { ++pos; return unary(value, depth + 1); }
+        return primary(value, depth);
+    }
+    bool primary(double& value, int depth) {
+        if (peek('(')) {
+            ++pos;
+            if (!sum(value, depth + 1) || !peek(')')) return false;
+            ++pos;
+            return true;
+        }
+        return number(value);
+    }
+    bool number(double& value) {
+        skip();
+        double whole = 0, fraction = 0, divisor = 1;
+        bool digits = false;
+        while (pos < s.size() && digit(s[pos])) { whole = whole * 10 + (s[pos++] - '0'); digits = true; }
+        if (pos < s.size() && (s[pos] == '.' || s[pos] == ',')) {
+            ++pos;
+            while (pos < s.size() && digit(s[pos])) {
+                fraction = fraction * 10 + (s[pos++] - '0');
+                divisor *= 10;
+                digits = true;
+            }
+        }
+        if (!digits) return false;
+        skip();
+        if (pos + 1 < s.size() && (s[pos] == 'm' || s[pos] == 'M') &&
+            (s[pos + 1] == 'm' || s[pos + 1] == 'M')) pos += 2;
+        value = whole + fraction / divisor;
+        return true;
+    }
+};
+}  // namespace detail
+
+inline bool evaluate(const std::string& text, double& result) {
+    return detail::Expression(text).evaluate(result);
+}
+
 struct Geometry {
     Box media, crop, trim, bleed;
     std::array<double,6> matrix;

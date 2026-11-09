@@ -146,16 +146,12 @@ NSTextField* addField(NSView* view, NSString* label, CGFloat y, CGFloat x, CGFlo
 bool parseSetting(NSString* text, int index, std::optional<double>& field) {
     const double minimum[] = {.1,.1,-5000,-5000,.1,.1,-360,0};
     const double maximum[] = {5000,5000,5000,5000,1000,1000,360,100};
-    std::string value(text.UTF8String);
+    const std::string value(text.UTF8String);
     field.reset();
     if (value.find_first_not_of(" \t") == std::string::npos) return true;
-    std::replace(value.begin(), value.end(), ',', '.');
-    std::istringstream stream(value);
-    stream.imbue(std::locale::classic());
-    double number;
-    if (!(stream >> number) || !std::isfinite(number) ||
-        number < minimum[index] || number > maximum[index] ||
-        !(stream >> std::ws).eof()) return false;
+    double number = 0;
+    if (!focal::evaluate(value, number) || number < minimum[index] || number > maximum[index])
+        return false;
     field = number;
     return true;
 }
@@ -371,6 +367,15 @@ NSString* numberText(double value) {
     return [NSString stringWithFormat:@"%.2f", value];
 }
 
+// Resultado de una operación: hasta 4 decimales, sin ceros sobrantes.
+NSString* resultText(double value) {
+    NSString* text = [NSString stringWithFormat:@"%.4f", value];
+    while ([text hasSuffix:@"0"]) text = [text substringToIndex:text.length - 1];
+    if ([text hasSuffix:@"."]) text = [text substringToIndex:text.length - 1];
+    if ([text isEqualToString:@"-0"] || text.length == 0) text = @"0";
+    return text;
+}
+
 NSString* const kLabels[8] = {
     @"Ancho del recorte (mm)", @"Alto del recorte (mm)",
     @"Desplazamiento X (mm)", @"Desplazamiento Y (mm)",
@@ -380,7 +385,7 @@ NSString* const kLabels[8] = {
 }  // namespace
 
 // Panel no modal: se queda abierto después de aplicar los cambios.
-@interface FocalPanelController : NSObject <NSWindowDelegate>
+@interface FocalPanelController : NSObject <NSWindowDelegate, NSTextFieldDelegate>
 @property (strong) NSPanel* panel;
 @property (strong) NSTextField* summary;
 @property (strong) NSTextField* status;
@@ -488,6 +493,7 @@ NSString* const kLabels[8] = {
     NSView* previous = nil;
     for (int i = 0; i < 8; ++i) {
         NSTextField* input = addField(fields, kLabels[i], 186 - 51 * (i / 2), 220 * (i % 2), 210);
+        input.delegate = self;
         if (previous) previous.nextKeyView = input;
         previous = input;
         [inputs addObject:input];
@@ -495,9 +501,10 @@ NSString* const kLabels[8] = {
     }
     previous.nextKeyView = range;
     range.nextKeyView = inputs[0];
-    NSTextField* hint = [NSTextField labelWithString:
-        @"Se muestra la geometría actual; solo se aplican los valores que cambies."];
-    hint.frame = NSMakeRect(0, 5, 430, 18);
+    NSTextField* hint = [NSTextField wrappingLabelWithString:
+        @"Se muestra la geometría actual; solo se aplican los valores que cambies. "
+        @"Puedes escribir operaciones, por ejemplo 210+3 o (297-6)/2."];
+    hint.frame = NSMakeRect(0, 3, 430, 28);
     hint.font = [NSFont systemFontOfSize:11];
     hint.textColor = [NSColor secondaryLabelColor];
     [fields addSubview:hint];
@@ -649,6 +656,19 @@ NSString* const kLabels[8] = {
 - (void)trimToggled:(NSButton*)sender {
     showTrim = sender.state == NSControlStateValueOn;
     redrawActive();
+}
+
+// Al salir de un campo, una operación como "122+2" se sustituye por su resultado.
+- (void)controlTextDidEndEditing:(NSNotification*)notification {
+    NSTextField* field = notification.object;
+    const NSUInteger index = [self.inputs indexOfObject:field];
+    if (index == NSNotFound) return;
+    NSString* text = field.stringValue;
+    if ([text isEqualToString:self.initial[index]]) return;
+    std::optional<double> value;
+    if (!parseSetting(text, static_cast<int>(index), value) || !value) return;
+    field.stringValue = [numberText(*value) isEqualToString:self.initial[index]]
+        ? self.initial[index] : resultText(*value);
 }
 
 - (void)applyPressed:(id)sender {
